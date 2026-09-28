@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Prueba: análisis de movimiento en el navegador</title>
+<style>
+  :root{--bg:#000;--surface:#131313;--line:#2a2a2a;--text:#f5f5f5;--muted:#a3a3a3;--red:#d91f26;--red-text:#ff4d52;}
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding:16px;}
+  h1{font-size:20px;margin:0 0 4px;}
+  p.sub{color:var(--muted);font-size:13px;margin:0 0 16px;}
+  .box{border:1px solid var(--line);border-radius:8px;padding:14px;margin-bottom:14px;background:var(--surface);}
+  input[type=file]{color:var(--text);}
+  .wrap{position:relative;max-width:480px;margin:0 auto;}
+  video,canvas{width:100%;display:block;border-radius:6px;}
+  canvas{position:absolute;top:0;left:0;pointer-events:none;}
+  .stats{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:12px;}
+  .stat{border:1px solid var(--line);border-radius:6px;padding:8px;text-align:center;}
+  .stat .k{font-size:11px;color:var(--muted);}
+  .stat .v{font-weight:700;font-size:20px;color:var(--red-text);}
+  .stat .rom{font-size:11px;color:var(--muted);margin-top:2px;}
+  button{background:var(--red);color:#fff;border:0;border-radius:4px;padding:10px 14px;font-weight:600;font-size:13px;margin-top:10px;margin-right:8px;}
+  .status{font-size:12px;color:var(--muted);margin-top:8px;}
+</style>
+</head>
+<body>
+<h1>Prueba de análisis de movimiento</h1>
+<p class="sub">Subí un video (plano sagital recomendado para esta prueba). Esto corre 100% en tu navegador, no se sube a ningún servidor.</p>
+
+<div class="box">
+  <input type="file" id="fileInput" accept="video/*">
+  <div class="status" id="status">Esperando modelo...</div>
+</div>
+
+<div class="wrap">
+  <video id="video" playsinline muted></video>
+  <canvas id="overlay"></canvas>
+</div>
+
+<div class="stats">
+  <div class="stat"><div class="k">Rodilla der.</div><div class="v" id="v-rodilla">--</div><div class="rom" id="rom-rodilla">ROM: --</div></div>
+  <div class="stat"><div class="k">Cadera der.</div><div class="v" id="v-cadera">--</div><div class="rom" id="rom-cadera">ROM: --</div></div>
+  <div class="stat"><div class="k">Codo der.</div><div class="v" id="v-codo">--</div><div class="rom" id="rom-codo">ROM: --</div></div>
+</div>
+<button id="resetBtn">Reiniciar ROM</button>
+
+<script type="module">
+import { FilesetResolver, PoseLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const statusEl = document.getElementById('status');
+const video = document.getElementById('video');
+const canvas = document.getElementById('overlay');
+const ctx = canvas.getContext('2d');
+const fileInput = document.getElementById('fileInput');
+const resetBtn = document.getElementById('resetBtn');
+
+const IDX = { LS:11, RS:12, LE:13, RE:14, LW:15, RW:16, LH:23, RH:24, LK:25, RK:26, LA:27, RA:28, LF:31, RF:32 };
+let rom = { rodilla:[999,-999], cadera:[999,-999], codo:[999,-999] };
+let poseLandmarker = null;
+let running = false;
+
+function angulo(a,b,c){
+  const ba=[a[0]-b[0],a[1]-b[1]], bc=[c[0]-b[0],c[1]-b[1]];
+  const dot=ba[0]*bc[0]+ba[1]*bc[1];
+  const magBa=Math.hypot(ba[0],ba[1]), magBc=Math.hypot(bc[0],bc[1]);
+  let cos = dot/(magBa*magBc+1e-9);
+  cos = Math.max(-1,Math.min(1,cos));
+  return Math.acos(cos)*180/Math.PI;
+}
+
+async function setup(){
+  statusEl.textContent = 'Descargando modelo de detección de pose (solo la primera vez)...';
+  const vision = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+  );
+  poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+    baseOptions: {
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+      delegate: "GPU"
+    },
+    runningMode: "VIDEO",
+    numPoses: 1
+  });
+  statusEl.textContent = 'Modelo listo. Subí un video para empezar.';
+}
+setup().catch(e=>{ statusEl.textContent = 'Error cargando el modelo: '+e.message; });
+
+fileInput.addEventListener('change', (e)=>{
+  const file = e.target.files[0];
+  if(!file) return;
+  video.src = URL.createObjectURL(file);
+  rom = { rodilla:[999,-999], cadera:[999,-999], codo:[999,-999] };
+  video.onloadedmetadata = ()=>{
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    video.play();
+    running = true;
+    loop();
+  };
+});
+
+resetBtn.addEventListener('click', ()=>{ rom = { rodilla:[999,-999], cadera:[999,-999], codo:[999,-999] }; });
+
+function setStat(id, val, romArr, romId){
+  document.getElementById(id).textContent = val==null ? '--' : val.toFixed(0)+'°';
+  const r = romArr[1] - romArr[0];
+  document.getElementById(romId).textContent = (romArr[0]>romArr[1]) ? 'ROM: --' : 'ROM: '+r.toFixed(0)+'°';
+}
+
+function loop(){
+  if(!running) return;
+  if(video.paused || video.ended){ requestAnimationFrame(loop); return; }
+  const result = poseLandmarker.detectForVideo(video, performance.now());
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  if(result.landmarks && result.landmarks.length){
+    const lm = result.landmarks[0];
+    const P = (i)=>[lm[i].x*canvas.width, lm[i].y*canvas.height];
+
+    ctx.fillStyle = '#ff4d52';
+    [IDX.RS,IDX.RE,IDX.RW,IDX.RH,IDX.RK,IDX.RA].forEach(i=>{
+      const [x,y]=P(i); ctx.beginPath(); ctx.arc(x,y,5,0,7); ctx.fill();
+    });
+    ctx.strokeStyle = '#f5f5f5'; ctx.lineWidth = 2;
+    function linea(i,j){ const [x1,y1]=P(i),[x2,y2]=P(j); ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke(); }
+    linea(IDX.RS,IDX.RE); linea(IDX.RE,IDX.RW); linea(IDX.RS,IDX.RH);
+    linea(IDX.RH,IDX.RK); linea(IDX.RK,IDX.RA);
+
+    const aRodilla = angulo(P(IDX.RH), P(IDX.RK), P(IDX.RA));
+    const aCadera  = angulo(P(IDX.RS), P(IDX.RH), P(IDX.RK));
+    const aCodo    = angulo(P(IDX.RS), P(IDX.RE), P(IDX.RW));
+
+    rom.rodilla = [Math.min(rom.rodilla[0],aRodilla), Math.max(rom.rodilla[1],aRodilla)];
+    rom.cadera  = [Math.min(rom.cadera[0],aCadera),  Math.max(rom.cadera[1],aCadera)];
+    rom.codo    = [Math.min(rom.codo[0],aCodo),      Math.max(rom.codo[1],aCodo)];
+
+    setStat('v-rodilla', aRodilla, rom.rodilla, 'rom-rodilla');
+    setStat('v-cadera', aCadera, rom.cadera, 'rom-cadera');
+    setStat('v-codo', aCodo, rom.codo, 'rom-codo');
+  }
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>
